@@ -1,0 +1,7 @@
+# Runtime dependencies. Build tools use only Python's standard library and Windows .NET.
+Pillow==12.3.0
+pypdf==6.10.0
+reportlab==4.4.9
+pypdfium2==5.13.0
+charset-normalizer==3.5.1
+pi-heif==1.4.0

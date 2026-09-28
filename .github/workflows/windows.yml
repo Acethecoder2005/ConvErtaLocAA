@@ -1,0 +1,81 @@
+name: Windows build and release
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install pinned runtime dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+      - name: Build portable Windows application
+        shell: pwsh
+        run: |
+          ./source/build.ps1 -PythonPath (Get-Command python).Source
+      - name: Test the packaged runtime and converter
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'example.heic'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/strukturag/libheif/v1.23.2/examples/example.heic' -OutFile $fixture
+          $tests = Join-Path $env:RUNNER_TEMP 'converter-tests'
+          & ./dist/ConvErtaLocAA/runtime/python.exe -I -B ./dist/ConvErtaLocAA/source/test_engine.py $tests $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Conversion integration tests failed.' }
+          $process = Start-Process -FilePath ./dist/ConvErtaLocAA/ConvErtaLocAA.exe -ArgumentList @('--self-test', ('"' + $tests + '"')) -PassThru -WindowStyle Hidden
+          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'UI tests timed out.' }
+          $result = Get-Content -LiteralPath (Join-Path $tests 'ui-test-result.txt') -Raw
+          Write-Output $result
+          if (-not $result.StartsWith('PASS:')) { throw 'UI integration tests failed.' }
+          if (Test-Path -LiteralPath (Join-Path $tests 'ui-errors.txt')) { throw 'UI reported an error.' }
+      - name: Collect decoder sources and notices
+        shell: pwsh
+        run: |
+          python -B ./tools/collect_decoder_sources.py ./dist/ConvErtaLocAA-decoder-sources.zip
+          if ($LASTEXITCODE -ne 0) { throw 'Decoder source collection failed.' }
+          $notices = './dist/ConvErtaLocAA/third-party-runtime-notices'
+          New-Item -ItemType Directory -Path $notices | Out-Null
+          python -B -c "import zipfile,pathlib; z=zipfile.ZipFile('dist/ConvErtaLocAA-decoder-sources.zip'); [(pathlib.Path('dist/ConvErtaLocAA/third-party-runtime-notices')/pathlib.PurePosixPath(n).name).write_bytes(z.read(n)) for n in z.namelist() if n.startswith('runtime-notices/')]"
+          if ($LASTEXITCODE -ne 0) { throw 'Copying runtime notices failed.' }
+      - name: Make release archive and checksums
+        shell: pwsh
+        run: |
+          Compress-Archive -Path ./dist/ConvErtaLocAA -DestinationPath ./dist/ConvErtaLocAA-windows-x64.zip
+          $lines = Get-ChildItem ./dist/*.zip | Sort-Object Name | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name }
+          [IO.File]::WriteAllLines((Join-Path $PWD 'dist/SHA256SUMS.txt'), [string[]]$lines)
+      - name: Retain distributable artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ConvErtaLocAA-windows-x64
+          path: |
+            dist/ConvErtaLocAA-windows-x64.zip
+            dist/ConvErtaLocAA-decoder-sources.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish the initial portable release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v0.2.0 --repo "${{ github.repository }}" 2>$null
+          if ($LASTEXITCODE -eq 0) { Write-Output 'Release v0.2.0 already exists; build artifacts are available above.'; exit 0 }
+          gh release create v0.2.0 ./dist/ConvErtaLocAA-windows-x64.zip ./dist/ConvErtaLocAA-decoder-sources.zip ./dist/SHA256SUMS.txt --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "ConvErtaLocAA 0.2.0" --notes-file RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the release failed.' }
